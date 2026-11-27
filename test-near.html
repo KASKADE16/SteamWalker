@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>CatNear test</title>
+<style>html,body{margin:0;height:100%;background:#0b0912;overflow:hidden}canvas{display:block}</style>
+</head>
+<body>
+<script src="three.min.js"></script>
+<script src="cat-mesh.js"></script>
+<script src="cat-rig.js"></script>
+<script src="cat-near.js"></script>
+<script>
+(function () {
+  'use strict';
+  var q = new URLSearchParams(location.search);
+  var action = q.get('a') || 'idle';
+  var view = q.get('v') || '3q';
+  var scale = parseFloat(q.get('s') || '1');
+
+  var scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x0b0912);
+  scene.fog = new THREE.FogExp2(0x08060f, 0.019);
+
+  var W = innerWidth, H = innerHeight;
+  var camera = new THREE.PerspectiveCamera(50, W / H, 0.02, 100);
+  var renderer = new THREE.WebGLRenderer({ antialias: true });
+  renderer.setPixelRatio(1);
+  renderer.setSize(W, H);
+  document.body.appendChild(renderer.domElement);
+
+  var grid = new THREE.GridHelper(12, 24, 0x2a2440, 0x1a1630);
+  scene.add(grid);
+
+  // one figure, standing on the floor at the origin
+  var fig = {
+    _i: 0, x: 0, z: 0, s: scale, ang: 0,
+    phase: 0, homeX: 0, homeZ: 0,
+    _color: new THREE.Color(0xffc861), _fur: 0.92, _age: 1, _coat: 1,
+    g: { n: 'TEST CAT' }
+  };
+  var figures = [fig];
+
+  var near = window.CatNear(THREE, window.CAT_MESH, {
+    scene: scene, max: 1, enter: 1000, exit: 1001
+  });
+
+  var pose = { x: 0, y: 0, z: 0, ang: 0, sx: 1, sy: 1, sz: 1 };
+  function poseOf(f, t, o) {
+    o.x = f.x; o.y = 0; o.z = f.z; o.ang = f.ang;
+    o.sx = f.s; o.sz = f.s;
+    o.sy = f.s * (1 + Math.sin(t * 0.9) * 0.008);
+    return o;
+  }
+  function actionOf() { return action; }
+
+  var t = 0, last = performance.now();
+  function tick(now) {
+    requestAnimationFrame(tick);
+    var dt = Math.min((now - last) / 1000, 0.05); last = now;
+    t += dt;
+    near.update(dt, t, camera, figures, actionOf, poseOf);
+
+    if (view === 'side') camera.position.set(3.1, 1.15, 0);
+    else if (view === 'front') camera.position.set(0, 1.15, 3.4);
+    else if (view === 'low') camera.position.set(2.2, 0.55, 2.6);
+    else camera.position.set(2.3, 1.35, 2.7);
+    camera.lookAt(0, 0.62 * scale, 0);
+
+    renderer.render(scene, camera);
+  }
+  requestAnimationFrame(tick);
+
+  window.__ready = true;
+  window.__setAction = function (a) { action = a; };
+  window.__info = function () {
+    var b = near.bounds()[0];
+    return b || null;
+  };
+  // Same numbers the game's instanced matrix uses, built independently, to
+  // prove the near cat swaps on an identical matrix.
+  window.__matrixCheck = function () {
+    var b = near.bounds()[0];
+    if (!b) return null;
+    var o = new THREE.Object3D();
+    poseOf(fig, t, pose);
+    o.position.set(pose.x, pose.y, pose.z);
+    o.rotation.set(0, pose.ang, 0);
+    o.scale.set(pose.sx, pose.sy, pose.sz);
+    o.updateMatrix();
+    var exp = o.matrix.elements, got = b.mat, maxd = 0;
+    for (var i = 0; i < 16; i++) maxd = Math.max(maxd, Math.abs(exp[i] - got[i]));
+    return { maxDiff: maxd, expected: exp.slice(0), actual: got.slice(0) };
+  };
+})();
+</script>
+</body>
+</html>

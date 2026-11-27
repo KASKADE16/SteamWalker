@@ -245,6 +245,8 @@ window.addEventListener('error', function (e) {
 <script src="three.min.js"></script>
 <script src="library.js"></script>
 <script src="cat-mesh.js"></script>
+<script src="cat-rig.js"></script>
+<script src="cat-near.js"></script>
 <script src="bgm-data.js"></script>
 <script>
 (function () {
@@ -710,7 +712,14 @@ window.addEventListener('error', function (e) {
     furAttr.setX(i, fur);
     ageAttr.setX(i, b);
     var hh = (f.g.i * 37 + 11) % 100;
-    coatAttr.setX(i, hh < 35 ? 0 : hh < 65 ? 1 : hh < 80 ? 2 : hh < 90 ? 3 : 4);
+    var coat = hh < 35 ? 0 : hh < 65 ? 1 : hh < 80 ? 2 : hh < 90 ? 3 : 4;
+    coatAttr.setX(i, coat);
+
+    // remembered so a near-field rig can copy the same look
+    f._color = c.clone();
+    f._fur = fur;
+    f._age = b;
+    f._coat = coat;
 
     dummy.position.set(f.x, 0, f.z);
     dummy.rotation.set(0, f.ang, 0);
@@ -761,6 +770,71 @@ window.addEventListener('error', function (e) {
     });
     eyes.instanceMatrix.needsUpdate = true;
     scene.add(eyes);
+  })();
+
+  // ---------- near-field LOD: rigged cats for the closest few ----------
+  // The instanced cat stays for the distance; the nearest 8 cats get a
+  // SkinnedMesh driven by CatRig.  Both draw from figurePose(), so the swap
+  // happens on an identical matrix and cannot jump.
+  var ZERO_MAT = new THREE.Matrix4().set(
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+  );
+  var sprinting = false;
+
+  function hideFigureEyes(f) {
+    if (!eyesMesh) return;
+    eyesMesh.setMatrixAt(f._i * 2, ZERO_MAT);
+    eyesMesh.setMatrixAt(f._i * 2 + 1, ZERO_MAT);
+    eyesMesh.instanceMatrix.needsUpdate = true;
+  }
+
+  var _pose = { x: 0, y: 0, z: 0, ang: 0, sx: 1, sy: 1, sz: 1 };
+  function figurePose(f, t, o) {
+    var ph = f.phase || 0;
+    o.x = f.x + Math.sin(t * 0.6 + ph) * 0.012;
+    // one-sided bob (0 .. 7 mm): the far instances still drift, but a near cat
+    // never gets pushed below the floor by it
+    o.y = (f._hop || 0) + 0.007 * (0.5 + 0.5 * Math.sin(t * 0.9 + ph));
+    o.z = f.z;
+    o.ang = f.ang;
+    o.sx = f.s;
+    o.sz = f.s;
+    o.sy = f.s * (1 + Math.sin(t * 0.9 + ph) * 0.008);
+    return o;
+  }
+
+  // What a cat is doing.  The rig only exists for near cats, but the same
+  // answer would apply anywhere: still = idle (occasionally groom), moving =
+  // walk, moving while the player sprints = run, hissing at a barely-played
+  // game = fight, and the two pair moods get their own face-off poses.
+  function catActionFor(f, t) {
+    if (pair && pair.phase === 'act' && (f === pair.a || f === pair.b)) {
+      return pair.kind === 'cuddle' ? 'curl' : 'standoff';
+    }
+    if (f._hissUntil && t < f._hissUntil) return 'fight';
+    if (f._groomUntil && t < f._groomUntil) return 'groom';
+    var moving = (f === follower && f._moving) || !!f._returning ||
+      (pair && pair.phase === 'approach' && (f === pair.a || f === pair.b));
+    if (moving) return sprinting ? 'run' : 'walk';
+    return 'idle';
+  }
+
+  var nearLOD = (function () {
+    if (!window.CatNear) return null;
+    return window.CatNear(THREE, window.CAT_MESH, {
+      scene: scene, max: 8, enter: 7.0, exit: 9.0,
+      onAttach: hideFigureEyes,
+      onDetach: function (f) { syncFigureAux(f); },
+      onCat: function (f, t) {
+        if (f._groomUntil && t > f._groomUntil) f._groomUntil = 0;
+        if (f._hissUntil && t > f._hissUntil) f._hissUntil = 0;
+        // a cat standing still has a 0.03 % chance per frame to start grooming
+        if (!f._groomUntil && !f._hissUntil && catActionFor(f, t) === 'idle' &&
+            Math.random() < 0.0003) {
+          f._groomUntil = t + 2.4 + Math.random() * 2.6;
+        }
+      }
+    });
   })();
 
   // ---------- your verdicts: wreath if recommended, cross if not ----------
@@ -831,7 +905,7 @@ window.addEventListener('error', function (e) {
 
     var hop = f._hop || 0;
     var ca = Math.cos(f.ang), sa = Math.sin(f.ang);
-    if (eyesMesh) {
+    if (eyesMesh && !f._nearSlot) {
       for (var k = 0; k < 2; k++) {
         var side = k === 0 ? -1 : 1;
         var lx = side * 0.068, ly = 0.795, lz = 0.842;
@@ -1272,17 +1346,30 @@ window.addEventListener('error', function (e) {
 
   var near = null, detailOpen = false, highlightIdx = -1;
 
+  function applyNearColor(i) {
+    if (i < 0) return;
+    var f = figures[i];
+    if (f && f._nearSlot && f._color) {
+      f._nearSlot.fur.uniforms.uColor.value.copy(f._color);
+    }
+  }
+
   function setHighlight(i) {
     if (i === highlightIdx) return;
-    if (highlightIdx >= 0) {
-      mesh.setColorAt(highlightIdx, baseColor[highlightIdx]);
-    }
+    var old = highlightIdx;
     highlightIdx = i;
+    if (old >= 0) {
+      mesh.setColorAt(old, baseColor[old]);
+      if (figures[old] && figures[old]._color) figures[old]._color.copy(baseColor[old]);
+    }
     if (i >= 0) {
       tmpColor.copy(baseColor[i]).multiplyScalar(1.55);
       mesh.setColorAt(i, tmpColor);
+      if (figures[i] && figures[i]._color) figures[i]._color.copy(tmpColor);
     }
     mesh.instanceColor.needsUpdate = true;
+    applyNearColor(old);
+    applyNearColor(i);
   }
 
   function showCard(f) {
@@ -1817,8 +1904,6 @@ window.addEventListener('error', function (e) {
     }
   }
 
-  function neverPlayed(f) { return f.g._h < 0.05; }
-
   function startReturn(f, dur) {
     f._returning = { t: 0, dur: dur || 1.1, x0: f.x, z0: f.z, a0: f.ang };
     f._busy = true;
@@ -1885,6 +1970,7 @@ window.addEventListener('error', function (e) {
     follower = f;
     f._following = true;
     f._busy = false;
+    f._moving = false;
     f._nextMeow = (clock ? clock.elapsedTime : 0) + 9 + Math.random() * 12;
     refreshFollowHud();
     closeMenu(false);
@@ -1978,6 +2064,7 @@ window.addEventListener('error', function (e) {
     var dist = Math.hypot(dx, dz);
     if (dist > 22) {
       f.x = tgt.x; f.z = tgt.z;
+      f._moving = true;
     } else if (dist > 0.08) {
       var sp = Math.min(11.5, 2.2 + dist * 3.4);
       var step = Math.min(dist, sp * dt);
@@ -1986,9 +2073,11 @@ window.addEventListener('error', function (e) {
       f._walkPhase = (f._walkPhase || 0) + step * 6.5;
       f._hop = Math.abs(Math.sin(f._walkPhase)) * 0.032;
       f.ang = turnTo(f.ang, Math.atan2(dx, dz), dt * 8);
+      f._moving = step > 0.005;
     } else {
       // arrived: stand still and keep the heading it arrived with
       f._hop = 0;
+      f._moving = false;
     }
     syncFigureAux(f);
     if (t > (f._nextMeow || 0)) {
@@ -2007,7 +2096,10 @@ window.addEventListener('error', function (e) {
     var len = Math.hypot(dx, dz);
     if (len < 0.15) { dx = 0; dz = 1; len = 1; }
     var ux = dx / len, uz = dz / len;
-    var sep = kind === 'cuddle' ? 0.56 : 1.55;
+    // Face to face: the gap has to fit two bodies, so it scales with the cats.
+    // cuddle -> curl nose to nose; fight -> standoff at a boxing distance.
+    var avgS = (a.s + b.s) * 0.5;
+    var sep = kind === 'cuddle' ? 1.18 * avgS : 1.72 * avgS;
     pair = {
       a: a, b: b, kind: kind,
       phase: 'approach', t: 0,
@@ -2080,7 +2172,8 @@ window.addEventListener('error', function (e) {
     var t = pair.t;
     var kind = pair.kind;
     if (kind === 'cuddle') {
-      var nudge = 0.032 + 0.022 * Math.sin(t * 2.2);
+      // curled nose to nose: only a breath of pressure, never enough to clip
+      var nudge = 0.010 + 0.006 * Math.sin(t * 2.2);
       a.x = pair.ax + pair.ux * nudge;
       a.z = pair.az + pair.uz * nudge;
       b.x = pair.bx - pair.ux * nudge;
@@ -2101,7 +2194,8 @@ window.addEventListener('error', function (e) {
       a.x = pair.mx + (pair.ax - pair.mx) * ca - (pair.az - pair.mz) * sa + pair.ux * lunge;
       a.z = pair.mz + (pair.ax - pair.mx) * sa + (pair.az - pair.mz) * ca + pair.uz * lunge;
       b.x = pair.mx + (pair.bx - pair.mx) * ca + (pair.bz - pair.mz) * sa - pair.ux * lunge * 0.6;
-      b.z = pair.mz + (pair.bx - pair.mx) * sa - (pair.bz - pair.mz) * ca - pair.uz * lunge * 0.6;
+      // b orbits the other way: rotate by -circ (x' = dx·ca + dz·sa, z' = -dx·sa + dz·ca)
+      b.z = pair.mz - (pair.bx - pair.mx) * sa + (pair.bz - pair.mz) * ca - pair.uz * lunge * 0.6;
       a._hop = Math.max(0, Math.sin(t * 4.1)) * 0.055;
       b._hop = Math.max(0, Math.sin(t * 4.1 + 0.7)) * 0.045;
       if (t > pair.nextFx) {
@@ -2114,15 +2208,10 @@ window.addEventListener('error', function (e) {
         spawnFx('老吴——', (a.x + b.x) / 2, Math.max(a.h, b.h) + 0.45, (a.z + b.z) / 2, { color: '#ffc49a', size: 0.55, life: 2.4, vy: 0.2 });
       }
     }
-    if (kind === 'cuddle') {
-      // side by side, fur against fur, rather than nose-to-nose clipping
-      var faceAng = Math.atan2(-pair.uz, pair.ux);
-      a.ang = turnTo(a.ang, faceAng, dt * 5);
-      b.ang = turnTo(b.ang, faceAng, dt * 5);
-    } else {
-      a.ang = turnTo(a.ang, Math.atan2(b.x - a.x, b.z - a.z), dt * 6);
-      b.ang = turnTo(b.ang, Math.atan2(a.x - b.x, a.z - b.z), dt * 6);
-    }
+    // both moods are face to face: curl noses down against each other, the
+    // standoff stares the other cat down
+    a.ang = turnTo(a.ang, Math.atan2(b.x - a.x, b.z - a.z), dt * 6);
+    b.ang = turnTo(b.ang, Math.atan2(a.x - b.x, a.z - b.z), dt * 6);
     syncFigureAux(a); syncFigureAux(b);
     var left = Math.max(0, 10 - t);
     actEl.textContent = (kind === 'cuddle' ? '贴贴' : '打架') + ' · ' +
@@ -2132,11 +2221,13 @@ window.addEventListener('error', function (e) {
 
   var LOOK_R2 = 4.8 * 4.8;
   function maybeHiss(f, t) {
-    if (!neverPlayed(f)) return;
+    // "barely played" is < 2 h: these are the cats that hiss when you walk by
+    if (!(f.g._h < 2)) return;
     if (t < (f._hissCd || 0)) return;
     f._hissCd = t + 15;
     if (Math.random() >= 0.10) return;
     f._lookUntil = t + 1.7;
+    f._hissUntil = t + 1.9;      // the hissing cat swipes at you (CatRig 'fight')
     hissAt(f);
     spawnFx('哈——', f.x, f.h * 1.02 + 0.15, f.z, { color: '#e9e4ff', size: 0.55, life: 1.2, vy: 0.35 });
   }
@@ -2439,7 +2530,8 @@ window.addEventListener('error', function (e) {
     var dt = Math.min(clock.getDelta(), 0.05);
 
     if (started) {
-      var speed = (keys['ShiftLeft'] || keys['ShiftRight']) ? 9.0 : 4.6;
+      sprinting = !!(keys['ShiftLeft'] || keys['ShiftRight']);
+      var speed = sprinting ? 9.0 : 4.6;
       fwd.set(Math.sin(yaw), 0, Math.cos(yaw)).multiplyScalar(-1);
       var rightX = Math.cos(yaw), rightZ = -Math.sin(yaw);
       var mx = 0, mz = 0;
@@ -2490,12 +2582,14 @@ window.addEventListener('error', function (e) {
     // gentle idle sway of all figures
     var t = clock.elapsedTime;
     updateCatLife(dt, t);
+    if (nearLOD) nearLOD.update(dt, t, camera, figures, catActionFor, figurePose);
     for (var i = 0; i < figures.length; i++) {
       var f = figures[i];
-      var sway = Math.sin(t * 0.6 + f.phase) * 0.012;
-      dummy.position.set(f.x + sway, f._hop || 0, f.z);
-      dummy.rotation.set(0, f.ang, 0);
-      dummy.scale.set(f.s, f.s * (1 + Math.sin(t * 0.9 + f.phase) * 0.008), f.s);
+      if (f._nearSlot) { mesh.setMatrixAt(i, ZERO_MAT); continue; }
+      figurePose(f, t, _pose);
+      dummy.position.set(_pose.x, _pose.y, _pose.z);
+      dummy.rotation.set(0, _pose.ang, 0);
+      dummy.scale.set(_pose.sx, _pose.sy, _pose.sz);
       dummy.updateMatrix();
       mesh.setMatrixAt(i, dummy.matrix);
     }
@@ -2560,6 +2654,11 @@ window.addEventListener('error', function (e) {
     fxTexts: function () { return fxList.map(function (e) { return { text: e.sprite.material.map && e.sprite.material.map.__text, x: e.sprite.position.x, y: e.sprite.position.y, z: e.sprite.position.z, age: e.age, life: e.life }; }); },
     isMenuOpen: function () { return menuOpen; },
     getKeys: function () { return keys; },
+    nearCats: function () { return nearLOD ? nearLOD.active() : []; },
+    nearBounds: function () { return nearLOD ? nearLOD.bounds() : []; },
+    nearBones: function () { return nearLOD ? nearLOD.boneCount() : 0; },
+    catAction: function (f) { return catActionFor(f, clock.elapsedTime); },
+    isSprinting: function () { return sprinting; },
     clearKeys: function () {
       for (var k in keys) keys[k] = false;
     }
